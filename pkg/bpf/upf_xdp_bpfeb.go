@@ -24,6 +24,7 @@ type upfXdpPrograms struct {
 
 type upfXdpMaps struct {
 	TeidPdrMap     *ebpf.Map `ebpf:"teid_pdr_map"`
+	QosFlowMap     *ebpf.Map `ebpf:"qos_flow_map"`
 	UpfStatsMap    *ebpf.Map `ebpf:"upf_stats_map"`
 	UpfForwardMap  *ebpf.Map `ebpf:"upf_forward_map"`
 }
@@ -38,6 +39,7 @@ func (o *upfXdpObjects) Close() error {
 		o.UpfXdpIngress,
 		o.UpfXdpEgress,
 		o.TeidPdrMap,
+		o.QosFlowMap,
 		o.UpfStatsMap,
 		o.UpfForwardMap,
 	)
@@ -50,6 +52,7 @@ type upfXdpSpec struct {
 	}
 	Maps struct {
 		TeidPdrMap    *ebpf.MapSpec
+		QosFlowMap    *ebpf.MapSpec
 		UpfStatsMap   *ebpf.MapSpec
 		UpfForwardMap *ebpf.MapSpec
 	}

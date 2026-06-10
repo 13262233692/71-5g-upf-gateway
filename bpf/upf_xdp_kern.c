@@ -20,6 +20,15 @@ struct {
 } teid_pdr_map SEC(".maps");
 
 struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, MAX_QOS_FLOWS);
+    __type(key, struct qos_flow_key);
+    __type(value, struct qos_flow_value);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
+} qos_flow_map SEC(".maps");
+
+struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, 1);
     __type(key, __u32);
@@ -133,9 +142,9 @@ static __always_inline int parse_gtpuhdr(struct hdr_cursor *nh,
     return 0;
 }
 
-static __always_inline void update_stats_ext(int packet_type, __u64 bytes,
+static __always_inline void update_stats_qos(int packet_type, __u64 bytes,
                                              __u64 torn_reads, __u64 lock_contention,
-                                             __u64 retries)
+                                             __u64 retries, int qos_result)
 {
     __u32 key = 0;
     struct stats *stats = bpf_map_lookup_elem(&upf_stats_map, &key);
@@ -167,6 +176,23 @@ static __always_inline void update_stats_ext(int packet_type, __u64 bytes,
             break;
         case 2:
             stats->drop_packets++;
+            break;
+    }
+
+    switch (qos_result) {
+        case 1:
+            stats->qos_shaped_packets++;
+            break;
+        case 2:
+            stats->qos_dropped_gbr_exceed++;
+            stats->drop_packets++;
+            break;
+        case 3:
+            stats->qos_dropped_mbr_exceed++;
+            stats->drop_packets++;
+            break;
+        case 4:
+            stats->qos_vonr_protected++;
             break;
     }
 }
@@ -228,6 +254,61 @@ static __always_inline int pdr_lookup_safe(struct pdr_key *key,
     return valid ? 0 : -1;
 }
 
+static __always_inline int qos_enforce_traffic_shaping(__be32 teid, __u8 qfi,
+                                                       __u64 pkt_len,
+                                                       __u64 now_ns)
+{
+    struct qos_flow_key qos_key = {
+        .teid = teid,
+        .qfi = qfi,
+    };
+    struct qos_flow_value *qflow;
+    int mbr_ok, gbr_ok;
+
+    qflow = bpf_map_lookup_elem(&qos_flow_map, &qos_key);
+    if (!qflow)
+        return 0;
+
+    if (qflow->magic != QOS_MAGIC)
+        return 0;
+
+    bpf_spin_lock(&qflow->lock);
+
+    qflow->total_bytes += pkt_len;
+
+    if (qflow->mbr_bps > 0) {
+        mbr_ok = token_bucket_consume(&qflow->bucket_mbr, pkt_len, now_ns);
+        if (!mbr_ok) {
+            qflow->dropped_bytes += pkt_len;
+            qflow->shaped_packets++;
+
+            bpf_spin_unlock(&qflow->lock);
+
+            if (qfi == QFI_VOVR) {
+                return 0;
+            }
+
+            return 3;
+        }
+    }
+
+    if (qflow->flow_type == QOS_FLOW_GBR && qflow->gbr_bps > 0) {
+        gbr_ok = token_bucket_consume(&qflow->bucket_gbr, pkt_len, now_ns);
+        if (!gbr_ok) {
+            if (qfi == QFI_VIDEO || qfi == QFI_DEFAULT) {
+                qflow->dropped_bytes += pkt_len;
+                qflow->shaped_packets++;
+
+                bpf_spin_unlock(&qflow->lock);
+                return 2;
+            }
+        }
+    }
+
+    bpf_spin_unlock(&qflow->lock);
+    return 0;
+}
+
 static __always_inline int decap_and_forward(struct xdp_md *ctx,
                                              struct hdr_cursor *nh,
                                              void *data_end,
@@ -276,10 +357,11 @@ int upf_xdp_ingress(struct xdp_md *ctx)
     int eth_type, ip_proto;
     __u64 pkt_len = data_end - data;
     __u64 torn_reads = 0, lock_contention = 0, retries = 0;
+    int qos_result = 0;
 
     eth_type = parse_ethhdr(&nh, data_end, &outer_eth);
     if (eth_type < 0) {
-        update_stats_ext(2, pkt_len, 0, 0, 0);
+        update_stats_qos(2, pkt_len, 0, 0, 0, 0);
         return XDP_DROP;
     }
 
@@ -288,7 +370,7 @@ int upf_xdp_ingress(struct xdp_md *ctx)
 
     ip_proto = parse_iphdr(&nh, data_end, &outer_ip);
     if (ip_proto < 0) {
-        update_stats_ext(2, pkt_len, 0, 0, 0);
+        update_stats_qos(2, pkt_len, 0, 0, 0, 0);
         return XDP_DROP;
     }
 
@@ -296,7 +378,7 @@ int upf_xdp_ingress(struct xdp_md *ctx)
         return XDP_PASS;
 
     if (parse_udphdr(&nh, data_end, &udph) < 0) {
-        update_stats_ext(2, pkt_len, 0, 0, 0);
+        update_stats_qos(2, pkt_len, 0, 0, 0, 0);
         return XDP_DROP;
     }
 
@@ -304,7 +386,7 @@ int upf_xdp_ingress(struct xdp_md *ctx)
         return XDP_PASS;
 
     if (parse_gtpuhdr(&nh, data_end, &gtpu, &gtpu_hdr_len) < 0) {
-        update_stats_ext(2, pkt_len, 0, 0, 0);
+        update_stats_qos(2, pkt_len, 0, 0, 0, 0);
         return XDP_DROP;
     }
 
@@ -315,23 +397,34 @@ int upf_xdp_ingress(struct xdp_md *ctx)
     struct pdr_value_snapshot pdr_snap;
 
     if (pdr_lookup_safe(&key, &pdr_snap, &torn_reads, &lock_contention, &retries) < 0) {
-        update_stats_ext(1, pkt_len, torn_reads, lock_contention, retries);
+        update_stats_qos(1, pkt_len, torn_reads, lock_contention, retries, 0);
         return XDP_DROP;
     }
 
     if (pdr_snap.action == PDR_ACTION_DROP) {
-        update_stats_ext(2, pkt_len, torn_reads, lock_contention, retries);
+        update_stats_qos(2, pkt_len, torn_reads, lock_contention, retries, 0);
         return XDP_DROP;
+    }
+
+    __u8 qfi = gtpu_extract_qfi(gtpu, data_end);
+    if (qfi > 0) {
+        __u64 now_ns = bpf_ktime_get_ns();
+        qos_result = qos_enforce_traffic_shaping(gtpu->teid, qfi, pkt_len, now_ns);
+
+        if (qos_result == 2 || qos_result == 3) {
+            update_stats_qos(2, pkt_len, torn_reads, lock_contention, retries, qos_result);
+            return XDP_DROP;
+        }
     }
 
     int action = decap_and_forward(ctx, &nh, data_end, outer_eth,
                                    gtpu_hdr_len, &pdr_snap);
     if (action < 0) {
-        update_stats_ext(2, pkt_len, torn_reads, lock_contention, retries);
+        update_stats_qos(2, pkt_len, torn_reads, lock_contention, retries, qos_result);
         return XDP_DROP;
     }
 
-    update_stats_ext(0, pkt_len, torn_reads, lock_contention, retries);
+    update_stats_qos(0, pkt_len, torn_reads, lock_contention, retries, qos_result);
     return action;
 }
 

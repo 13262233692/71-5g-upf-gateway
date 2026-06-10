@@ -8,6 +8,7 @@ import (
 	"syscall"
 
 	"github.com/5g-upf/upf-gateway/internal/config"
+	bpfpkg "github.com/5g-upf/upf-gateway/pkg/bpf"
 	"github.com/5g-upf/upf-gateway/pkg/upf"
 )
 
@@ -120,6 +121,61 @@ func demoData(service *upf.Service) {
 		for teid, pdr := range kernelPDRs {
 			fmt.Printf("  TEID=0x%08x -> DstMAC=%v, IfIndex=%d, QFI=%d, Action=%d\n",
 				teid, net.HardwareAddr(pdr.DstMAC[:]), pdr.IfIndex, pdr.QFI, pdr.Action)
+		}
+	}
+
+	fmt.Println("\nLoading demo QoS flow rules...")
+
+	qosFlows := []*upf.QoSFlow{
+		{
+			TEID:       0x00000001,
+			QFI:        bpfpkg.QFIVoNR,
+			FlowType:   bpfpkg.QOSFlowGBR,
+			Priority:   1,
+			GBRBps:     64000,
+			MBRBps:     128000,
+			BurstBytes: 16000,
+		},
+		{
+			TEID:       0x00000001,
+			QFI:        bpfpkg.QFIVideo,
+			FlowType:   bpfpkg.QOSFlowGBR,
+			Priority:   3,
+			GBRBps:     5000000,
+			MBRBps:     10000000,
+			BurstBytes: 625000,
+		},
+		{
+			TEID:       0x00000003,
+			QFI:        bpfpkg.QFIIMS,
+			FlowType:   bpfpkg.QOSFlowNonGBR,
+			Priority:   5,
+			GBRBps:     0,
+			MBRBps:     1000000,
+			BurstBytes: 125000,
+		},
+		{
+			TEID:       0x00000005,
+			QFI:        bpfpkg.QFIDefault,
+			FlowType:   bpfpkg.QOSFlowNonGBR,
+			Priority:   7,
+			GBRBps:     0,
+			MBRBps:     500000,
+			BurstBytes: 62500,
+		},
+	}
+
+	for _, flow := range qosFlows {
+		if err := service.AddQoSFlow(flow); err != nil {
+			fmt.Printf("Warning: failed to add QoS flow TEID=0x%08x QFI=%d: %v\n",
+				flow.TEID, flow.QFI, err)
+		} else {
+			flowType := "Non-GBR"
+			if flow.FlowType == bpfpkg.QOSFlowGBR {
+				flowType = "GBR"
+			}
+			fmt.Printf("Created QoS flow: TEID=0x%08x, QFI=%d, Type=%s, Priority=%d, GBR=%dbps, MBR=%dbps\n",
+				flow.TEID, flow.QFI, flowType, flow.Priority, flow.GBRBps, flow.MBRBps)
 		}
 	}
 

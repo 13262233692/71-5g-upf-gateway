@@ -58,6 +58,27 @@ func (m *Manager) SetInterfaceUp(ifaceName string) error {
 	return errors.New("netlink not supported on this platform")
 }
 
+func (m *Manager) AddQoSFlow(teid uint32, qfi uint8, flowType uint8, priority uint8,
+	gbrBps uint64, mbrBps uint64, burstBytes uint64) error {
+	return errors.New("BPF maps not supported on this platform")
+}
+
+func (m *Manager) RemoveQoSFlow(teid uint32, qfi uint8) error {
+	return errors.New("BPF maps not supported on this platform")
+}
+
+func (m *Manager) GetQoSFlow(teid uint32, qfi uint8) (*QoSFlowValue, error) {
+	return nil, errors.New("BPF maps not supported on this platform")
+}
+
+func (m *Manager) UpdateQoSFlowRates(teid uint32, qfi uint8, gbrBps uint64, mbrBps uint64) error {
+	return errors.New("BPF maps not supported on this platform")
+}
+
+func (m *Manager) ListQoSFlows() (map[QoSFlowKey]QoSFlowValue, error) {
+	return nil, errors.New("BPF maps not supported on this platform")
+}
+
 func (m *Manager) Close() error {
 	return nil
 }

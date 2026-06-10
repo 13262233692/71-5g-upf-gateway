@@ -8,6 +8,7 @@ import (
 	"time"
 
 	bpfpkg "github.com/5g-upf/upf-gateway/pkg/bpf"
+	"github.com/5g-upf/upf-gateway/pkg/pfcp"
 )
 
 type Config struct {
@@ -25,6 +26,7 @@ type Service struct {
 	bpf            *bpfpkg.Manager
 	sessionMgr     *SessionManager
 	pdrMgr         *PDRManager
+	qosMgr         *QoSManager
 	mu             sync.RWMutex
 	running        bool
 	ctx            context.Context
@@ -84,6 +86,7 @@ func (s *Service) Start() error {
 
 	s.sessionMgr = NewSessionManager(s.bpf)
 	s.pdrMgr = NewPDRManager(s.bpf)
+	s.qosMgr = NewQoSManager(s.bpf)
 
 	if s.config.StatsInterval > 0 {
 		s.statsTicker = time.NewTicker(s.config.StatsInterval)
@@ -145,6 +148,10 @@ func (s *Service) logStats(stats *bpfpkg.Stats) {
 	fmt.Printf("Torn Reads:     %d\n", stats.TornReadDetected)
 	fmt.Printf("Lock Contention:%d\n", stats.SpinLockContention)
 	fmt.Printf("PDR Retries:    %d\n", stats.PDRUpdateRetries)
+	fmt.Printf("QoS Shaped:     %d\n", stats.QoSShapedPackets)
+	fmt.Printf("QoS Drop(GBR):  %d\n", stats.QoSDroppedGBR)
+	fmt.Printf("QoS Drop(MBR):  %d\n", stats.QoSDroppedMBR)
+	fmt.Printf("VoNR Protected: %d\n", stats.QoSVoNRProtected)
 
 	if stats.GtpuPackets > 0 {
 		hitRate := float64(stats.TeidHit) / float64(stats.GtpuPackets) * 100
@@ -154,6 +161,11 @@ func (s *Service) logStats(stats *bpfpkg.Stats) {
 	if stats.TornReadDetected > 0 {
 		tornRate := float64(stats.TornReadDetected) / float64(stats.GtpuPackets) * 100
 		fmt.Printf("Torn Read Rate: %.6f%%\n", tornRate)
+	}
+
+	if stats.QoSShapedPackets > 0 && stats.GtpuPackets > 0 {
+		shapeRate := float64(stats.QoSShapedPackets) / float64(stats.GtpuPackets) * 100
+		fmt.Printf("QoS Shape Rate: %.4f%%\n", shapeRate)
 	}
 	fmt.Println("========================")
 }
@@ -237,4 +249,53 @@ func (s *Service) IsRunning() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.running
+}
+
+func (s *Service) QoSManager() *QoSManager {
+	return s.qosMgr
+}
+
+func (s *Service) AddQoSFlow(flow *QoSFlow) error {
+	if !s.running {
+		return fmt.Errorf("service not running")
+	}
+	return s.qosMgr.AddFlow(flow)
+}
+
+func (s *Service) RemoveQoSFlow(teid uint32, qfi uint8) error {
+	if !s.running {
+		return fmt.Errorf("service not running")
+	}
+	return s.qosMgr.RemoveFlow(teid, qfi)
+}
+
+func (s *Service) UpdateQoSRates(teid uint32, qfi uint8, gbrBps uint64, mbrBps uint64) error {
+	if !s.running {
+		return fmt.Errorf("service not running")
+	}
+	return s.qosMgr.UpdateRates(teid, qfi, gbrBps, mbrBps)
+}
+
+func (s *Service) ListQoSFlows() []*QoSFlow {
+	if !s.running {
+		return nil
+	}
+	return s.qosMgr.ListFlows()
+}
+
+func (s *Service) HandlePFCPModification(msg *pfcp.Message) error {
+	if !s.running {
+		return fmt.Errorf("service not running")
+	}
+
+	mod, err := pfcp.ParseSessionModification(msg)
+	if err != nil {
+		return fmt.Errorf("parsing PFCP session modification: %w", err)
+	}
+
+	if err := s.qosMgr.ApplyPFCPModification(mod); err != nil {
+		return fmt.Errorf("applying PFCP QoS modification: %w", err)
+	}
+
+	return nil
 }

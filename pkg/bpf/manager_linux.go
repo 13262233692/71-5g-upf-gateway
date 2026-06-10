@@ -46,6 +46,7 @@ func (m *Manager) LoadBPFProgram() error {
 		m    *ebpf.Map
 	}{
 		{"teid_pdr_map", objs.TeidPdrMap},
+		{"qos_flow_map", objs.QosFlowMap},
 		{"upf_stats_map", objs.UpfStatsMap},
 		{"upf_forward_map", objs.UpfForwardMap},
 	}
@@ -217,6 +218,10 @@ func (m *Manager) GetStats() (*Stats, error) {
 		total.TornReadDetected += cpuStats.TornReadDetected
 		total.SpinLockContention += cpuStats.SpinLockContention
 		total.PDRUpdateRetries += cpuStats.PDRUpdateRetries
+		total.QoSShapedPackets += cpuStats.QoSShapedPackets
+		total.QoSDroppedGBR += cpuStats.QoSDroppedGBR
+		total.QoSDroppedMBR += cpuStats.QoSDroppedMBR
+		total.QoSVoNRProtected += cpuStats.QoSVoNRProtected
 	}
 
 	return &total, nil
@@ -244,6 +249,87 @@ func (m *Manager) SetInterfaceUp(ifaceName string) error {
 		return err
 	}
 	return netlink.LinkSetUp(link)
+}
+
+func (m *Manager) AddQoSFlow(teid uint32, qfi uint8, flowType uint8, priority uint8,
+	gbrBps uint64, mbrBps uint64, burstBytes uint64) error {
+
+	key := QoSFlowKey{TEID: teid, QFI: qfi}
+
+	burstBits := burstBytes * 8
+
+	value := QoSFlowValue{
+		Lock:      0,
+		Magic:     QOSMagic,
+		QFI:       qfi,
+		FlowType:  flowType,
+		Priority:  priority,
+		Action:    QOSActionPass,
+		GBRBps:    gbrBps,
+		MBRBps:    mbrBps,
+		BucketGBR: TokenBucket{
+			Tokens:       burstBits,
+			LastUpdateNs: 0,
+			RateBps:      gbrBps,
+			BurstSize:    burstBits,
+			Magic:        QOSMagic,
+		},
+		BucketMBR: TokenBucket{
+			Tokens:       burstBits,
+			LastUpdateNs: 0,
+			RateBps:      mbrBps,
+			BurstSize:    burstBits,
+			Magic:        QOSMagic,
+		},
+		TotalBytes:    0,
+		DroppedBytes:  0,
+		ShapedPackets: 0,
+	}
+
+	return m.objs.QosFlowMap.Put(key, value)
+}
+
+func (m *Manager) RemoveQoSFlow(teid uint32, qfi uint8) error {
+	key := QoSFlowKey{TEID: teid, QFI: qfi}
+	return m.objs.QosFlowMap.Delete(key)
+}
+
+func (m *Manager) GetQoSFlow(teid uint32, qfi uint8) (*QoSFlowValue, error) {
+	key := QoSFlowKey{TEID: teid, QFI: qfi}
+	var value QoSFlowValue
+	err := m.objs.QosFlowMap.Lookup(key, &value)
+	if err != nil {
+		return nil, err
+	}
+	return &value, nil
+}
+
+func (m *Manager) UpdateQoSFlowRates(teid uint32, qfi uint8, gbrBps uint64, mbrBps uint64) error {
+	existing, err := m.GetQoSFlow(teid, qfi)
+	if err != nil {
+		return err
+	}
+
+	existing.GBRBps = gbrBps
+	existing.MBRBps = mbrBps
+	existing.BucketGBR.RateBps = gbrBps
+	existing.BucketMBR.RateBps = mbrBps
+
+	key := QoSFlowKey{TEID: teid, QFI: qfi}
+	return m.objs.QosFlowMap.Put(key, *existing)
+}
+
+func (m *Manager) ListQoSFlows() (map[QoSFlowKey]QoSFlowValue, error) {
+	result := make(map[QoSFlowKey]QoSFlowValue)
+	var key QoSFlowKey
+	var value QoSFlowValue
+
+	iter := m.objs.QosFlowMap.Iterate()
+	for iter.Next(&key, &value) {
+		result[key] = value
+	}
+
+	return result, iter.Err()
 }
 
 func (m *Manager) Close() error {
