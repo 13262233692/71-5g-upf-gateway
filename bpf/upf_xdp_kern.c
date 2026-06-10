@@ -15,6 +15,7 @@ struct {
     __uint(max_entries, MAX_TEID_ENTRIES);
     __type(key, struct pdr_key);
     __type(value, struct pdr_value);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
     __uint(pinning, LIBBPF_PIN_BY_NAME);
 } teid_pdr_map SEC(".maps");
 
@@ -132,7 +133,9 @@ static __always_inline int parse_gtpuhdr(struct hdr_cursor *nh,
     return 0;
 }
 
-static __always_inline void update_stats(int packet_type, __u64 bytes)
+static __always_inline void update_stats_ext(int packet_type, __u64 bytes,
+                                             __u64 torn_reads, __u64 lock_contention,
+                                             __u64 retries)
 {
     __u32 key = 0;
     struct stats *stats = bpf_map_lookup_elem(&upf_stats_map, &key);
@@ -142,6 +145,13 @@ static __always_inline void update_stats(int packet_type, __u64 bytes)
 
     stats->rx_packets++;
     stats->rx_bytes += bytes;
+
+    if (torn_reads)
+        stats->torn_read_detected += torn_reads;
+    if (lock_contention)
+        stats->spin_lock_contention += lock_contention;
+    if (retries)
+        stats->pdr_update_retries += retries;
 
     switch (packet_type) {
         case 0:
@@ -161,12 +171,69 @@ static __always_inline void update_stats(int packet_type, __u64 bytes)
     }
 }
 
+static __always_inline int pdr_lookup_safe(struct pdr_key *key,
+                                           struct pdr_value_snapshot *snap,
+                                           __u64 *torn_reads,
+                                           __u64 *lock_contention,
+                                           __u64 *retries)
+{
+    struct pdr_value *pdr;
+    __u32 version_before, version_after;
+    int retry;
+    int valid = 0;
+
+    pdr = bpf_map_lookup_elem(&teid_pdr_map, key);
+    if (!pdr)
+        return -1;
+
+    for (retry = 0; retry < PDR_RETRY_MAX; retry++) {
+#ifdef SPIN_LOCK_ENABLED
+        bpf_spin_lock(&pdr->lock);
+#endif
+
+        version_before = pdr->version;
+        __builtin_memcpy(snap, &pdr->magic, sizeof(*snap));
+
+#ifdef SPIN_LOCK_ENABLED
+        bpf_spin_unlock(&pdr->lock);
+#endif
+
+#ifdef TORN_READ_DETECT
+        if (pdr->magic != PDR_MAGIC) {
+            if (retries) (*retries)++;
+            continue;
+        }
+
+        version_after = pdr->version;
+        if (version_before != version_after) {
+            if (torn_reads) (*torn_reads)++;
+            if (retries) (*retries)++;
+            continue;
+        }
+
+        if (!pdr_verify_integrity(snap)) {
+            if (torn_reads) (*torn_reads)++;
+            if (retries) (*retries)++;
+            continue;
+        }
+#endif
+
+        valid = 1;
+        break;
+    }
+
+    if (!valid && torn_reads)
+        (*torn_reads)++;
+
+    return valid ? 0 : -1;
+}
+
 static __always_inline int decap_and_forward(struct xdp_md *ctx,
                                              struct hdr_cursor *nh,
                                              void *data_end,
                                              struct ethhdr *outer_eth,
                                              __u16 gtpu_hdr_len,
-                                             struct pdr_value *pdr)
+                                             struct pdr_value_snapshot *pdr)
 {
     __u32 outer_hdr_len = sizeof(struct ethhdr) + sizeof(struct iphdr) +
                           sizeof(struct udphdr) + gtpu_hdr_len;
@@ -208,10 +275,11 @@ int upf_xdp_ingress(struct xdp_md *ctx)
     __u16 gtpu_hdr_len;
     int eth_type, ip_proto;
     __u64 pkt_len = data_end - data;
+    __u64 torn_reads = 0, lock_contention = 0, retries = 0;
 
     eth_type = parse_ethhdr(&nh, data_end, &outer_eth);
     if (eth_type < 0) {
-        update_stats(2, pkt_len);
+        update_stats_ext(2, pkt_len, 0, 0, 0);
         return XDP_DROP;
     }
 
@@ -220,7 +288,7 @@ int upf_xdp_ingress(struct xdp_md *ctx)
 
     ip_proto = parse_iphdr(&nh, data_end, &outer_ip);
     if (ip_proto < 0) {
-        update_stats(2, pkt_len);
+        update_stats_ext(2, pkt_len, 0, 0, 0);
         return XDP_DROP;
     }
 
@@ -228,7 +296,7 @@ int upf_xdp_ingress(struct xdp_md *ctx)
         return XDP_PASS;
 
     if (parse_udphdr(&nh, data_end, &udph) < 0) {
-        update_stats(2, pkt_len);
+        update_stats_ext(2, pkt_len, 0, 0, 0);
         return XDP_DROP;
     }
 
@@ -236,7 +304,7 @@ int upf_xdp_ingress(struct xdp_md *ctx)
         return XDP_PASS;
 
     if (parse_gtpuhdr(&nh, data_end, &gtpu, &gtpu_hdr_len) < 0) {
-        update_stats(2, pkt_len);
+        update_stats_ext(2, pkt_len, 0, 0, 0);
         return XDP_DROP;
     }
 
@@ -244,26 +312,26 @@ int upf_xdp_ingress(struct xdp_md *ctx)
         return XDP_PASS;
 
     struct pdr_key key = { .teid = gtpu->teid };
-    struct pdr_value *pdr = bpf_map_lookup_elem(&teid_pdr_map, &key);
+    struct pdr_value_snapshot pdr_snap;
 
-    if (!pdr) {
-        update_stats(1, pkt_len);
+    if (pdr_lookup_safe(&key, &pdr_snap, &torn_reads, &lock_contention, &retries) < 0) {
+        update_stats_ext(1, pkt_len, torn_reads, lock_contention, retries);
         return XDP_DROP;
     }
 
-    if (pdr->action == PDR_ACTION_DROP) {
-        update_stats(2, pkt_len);
+    if (pdr_snap.action == PDR_ACTION_DROP) {
+        update_stats_ext(2, pkt_len, torn_reads, lock_contention, retries);
         return XDP_DROP;
     }
 
     int action = decap_and_forward(ctx, &nh, data_end, outer_eth,
-                                   gtpu_hdr_len, pdr);
+                                   gtpu_hdr_len, &pdr_snap);
     if (action < 0) {
-        update_stats(2, pkt_len);
+        update_stats_ext(2, pkt_len, torn_reads, lock_contention, retries);
         return XDP_DROP;
     }
 
-    update_stats(0, pkt_len);
+    update_stats_ext(0, pkt_len, torn_reads, lock_contention, retries);
     return action;
 }
 

@@ -120,6 +120,22 @@ func (m *Manager) DetachXDP() error {
 	return nil
 }
 
+func calcPDRChecksum(value *PDRValue) uint32 {
+	var sum uint32 = 0
+
+	sum += value.Magic
+	sum += value.Version
+	for i := 0; i < 6; i++ {
+		sum += uint32(value.DstMAC[i]) << (8 * (i % 4))
+	}
+	sum += value.IfIndex
+	sum += uint32(value.QFI)
+	sum += uint32(value.Action)
+	sum += value.SdfFilter
+
+	return ^sum
+}
+
 func (m *Manager) AddPDR(teid uint32, dstMAC net.HardwareAddr, ifIndex uint32, qfi uint8, action uint8) error {
 	teidBytes := make([]byte, 4)
 	binary.BigEndian.PutUint32(teidBytes, teid)
@@ -127,12 +143,25 @@ func (m *Manager) AddPDR(teid uint32, dstMAC net.HardwareAddr, ifIndex uint32, q
 	var macArr [6]byte
 	copy(macArr[:], dstMAC)
 
-	value := PDRValue{
-		DstMAC:  macArr,
-		IfIndex: ifIndex,
-		QFI:     qfi,
-		Action:  action,
+	var existingVersion uint32 = 0
+	existing, err := m.GetPDR(teid)
+	if err == nil && existing.Magic == PDRMagic {
+		existingVersion = existing.Version
 	}
+
+	value := PDRValue{
+		Lock:      0,
+		Magic:     PDRMagic,
+		Version:   existingVersion + 1,
+		DstMAC:    macArr,
+		IfIndex:   ifIndex,
+		QFI:       qfi,
+		Action:    action,
+		SdfFilter: 0,
+		Checksum:  0,
+		Reserved:  0,
+	}
+	value.Checksum = calcPDRChecksum(&value)
 
 	return m.objs.TeidPdrMap.Put(key, value)
 }
@@ -185,6 +214,9 @@ func (m *Manager) GetStats() (*Stats, error) {
 		total.GtpuPackets += cpuStats.GtpuPackets
 		total.TeidMiss += cpuStats.TeidMiss
 		total.TeidHit += cpuStats.TeidHit
+		total.TornReadDetected += cpuStats.TornReadDetected
+		total.SpinLockContention += cpuStats.SpinLockContention
+		total.PDRUpdateRetries += cpuStats.PDRUpdateRetries
 	}
 
 	return &total, nil

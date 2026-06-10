@@ -142,10 +142,18 @@ func (s *Service) logStats(stats *bpfpkg.Stats) {
 	fmt.Printf("GTP-U Packets:  %d\n", stats.GtpuPackets)
 	fmt.Printf("TEID Hit:       %d\n", stats.TeidHit)
 	fmt.Printf("TEID Miss:      %d\n", stats.TeidMiss)
+	fmt.Printf("Torn Reads:     %d\n", stats.TornReadDetected)
+	fmt.Printf("Lock Contention:%d\n", stats.SpinLockContention)
+	fmt.Printf("PDR Retries:    %d\n", stats.PDRUpdateRetries)
 
 	if stats.GtpuPackets > 0 {
 		hitRate := float64(stats.TeidHit) / float64(stats.GtpuPackets) * 100
 		fmt.Printf("TEID Hit Rate:  %.2f%%\n", hitRate)
+	}
+
+	if stats.TornReadDetected > 0 {
+		tornRate := float64(stats.TornReadDetected) / float64(stats.GtpuPackets) * 100
+		fmt.Printf("Torn Read Rate: %.6f%%\n", tornRate)
 	}
 	fmt.Println("========================")
 }
